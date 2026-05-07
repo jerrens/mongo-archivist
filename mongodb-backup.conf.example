@@ -1,0 +1,29 @@
+# MongoDB Backup Configuration
+# Format: key=value pairs (no sections, comments start with #)
+
+# Required: MongoDB connection string
+mongo_uri=mongodb://mongoadmin:S3cr3t@192.168.1.100/
+
+# Required: Root directory where timestamped backup folders will be created
+backup_root=/mnt/backups/mongodb
+
+# Optional: Max concurrent mongodump processes (default: 4)
+parallel_jobs=4
+
+# Optional: Space-separated list of databases to always exclude (default: admin config local)
+exclude_databases=admin config local
+
+# Optional: Assumed disk space in bytes when no previous backup exists (default: 53687091200 = 50 GB)
+# fallback_required_bytes=53687091200
+
+# Optional: Override mongosh command for container execution
+# mongosh_cmd=docker run --rm docker.io/alpine/mongosh:latest mongosh
+
+# Optional: Override mongodump command for container execution
+# Note: The mongodump command must write to the backup directory, so we mount it as a volume.
+# mongodump_cmd=docker run --rm --volume /var/backups/mongodb:/var/backups/mongodb docker.io/alpine/mongosh:latest mongodump
+
+
+# Optional: Override mongorestore command for container execution
+# Note: The mongorestore command must read from the backup directory, so we mount it as a volume.
+# mongorestore_cmd=docker run --rm --volume /var/backups/mongodb:/var/backups/mongodb docker.io/alpine/mongosh:latest mongorestore
