@@ -1,0 +1,14 @@
+{
+    "version": "0.2",
+    "language": "en",
+    "dictionaries": [],
+    "useGitignore": true,
+    "ignorePaths": [],
+    "dictionaryDefinitions": [],
+    "ignoreWords": [
+        "PIDS",
+    ],
+    "ignoreRegExpList": [],
+    "languageSettings": [],
+    "words": []
+}
