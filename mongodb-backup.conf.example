@@ -21,9 +21,10 @@ exclude_databases=admin config local
 
 # Optional: Override mongodump command for container execution
 # Note: The mongodump command must write to the backup directory, so we mount it as a volume.
+# mongodump_cmd=mongodump --ssl --tlsInsecure --authenticationMechanism=SCRAM-SHA-256 --authenticationDatabase=admin
 # mongodump_cmd=docker run --rm --volume /var/backups/mongodb:/var/backups/mongodb docker.io/alpine/mongosh:latest mongodump
-
 
 # Optional: Override mongorestore command for container execution
 # Note: The mongorestore command must read from the backup directory, so we mount it as a volume.
+# mongorestore_cmd=mongorestore --ssl --tlsInsecure --authenticationMechanism=SCRAM-SHA-256 --authenticationDatabase=admin
 # mongorestore_cmd=docker run --rm --volume /var/backups/mongodb:/var/backups/mongodb docker.io/alpine/mongosh:latest mongorestore

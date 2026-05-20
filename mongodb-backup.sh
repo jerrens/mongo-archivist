@@ -82,8 +82,8 @@ log() {
             echo "$line"
         fi
 
-        # Print to the log file if it has been defined
-        if [[ -n "${LOG_FILE:-}" ]]; then
+        # Print to the log file if it has been defined and exists
+        if [[ -n "${LOG_FILE:-}" ]] && [[ -f "$LOG_FILE" ]]; then
             echo "$line" >> "$LOG_FILE"
         fi
     fi
@@ -444,17 +444,18 @@ backup_collection() {
     local target="${db_dir}/${collection}.archive.gz"
     local stderr_file="${target}.stderr.log.$$"
 
-    log 2 "  CMD      ${db}/${collection}: ${MONGODUMP_CMD} --uri=$(redact_uri "${MONGO_URI}") --db=${db} --collection=${collection} --archive=${target} --gzip --quiet"
+    log 2 "  CMD      ${db}/${collection}: ${MONGODUMP_CMD} --uri=\"$(redact_uri "${MONGO_URI}")\" --db=${db} --collection=${collection} --archive=${target} --gzip --quiet"
 
     if $MONGODUMP_CMD \
-        --uri="${MONGO_URI}" \
+        --uri=\""${MONGO_URI}"\" \
         --db="$db" \
         --collection="$collection" \
         --archive="$target" \
         --gzip \
         --quiet \
         2>"$stderr_file"; then
-        rm -f "$stderr_file"
+        # Don't delete the log file if there were errors captured
+        [[ ! -s "$stderr_file" ]] && rm -f "$stderr_file"
         return 0
     fi
 
@@ -470,7 +471,7 @@ backup_collection() {
         fi
     fi
 
-    rm -f "$stderr_file"
+    [[ ! -s "$stderr_file" ]] && rm -f "$stderr_file"
     return "$rc"
 }
 
