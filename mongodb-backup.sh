@@ -16,7 +16,7 @@
 set -euo pipefail
 
 __Author="Jerren Saunders"
-__Version="26.5.7"
+__Version="26.5.21"
 __ExePath="$0" # Executable path as called
 __ScriptName=$(basename "$0") # File name with extension
 __AppDir=$(dirname "$0") # Path where script is stored
@@ -89,11 +89,128 @@ log() {
     fi
 }
 
+# log_stderr <level> <message>
+# Same as log(), but always writes to stderr for pipeline-safe diagnostics.
+log_stderr() {
+    local level="$1"
+    local msg="$2"
+    if (( VERBOSE >= level )); then
+        local ts
+        ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        local line="[${ts}] ${msg}"
+
+        echo "$line" >&2
+
+        if [[ -n "${LOG_FILE:-}" ]] && [[ -f "$LOG_FILE" ]]; then
+            echo "$line" >> "$LOG_FILE"
+        fi
+    fi
+}
+
 # redact_uri <uri>
 # Replaces the password component of a MongoDB URI with REDACTED.
 # e.g. mongodb://user:secret@host:27017/ → mongodb://user:REDACTED@host:27017/
 redact_uri() {
     echo "$1" | sed 's|\(://[^:@]*\):[^@]*@|\1:REDACTED@|'
+}
+
+# shell_join <arg1> [arg2 ...]
+# Returns a shell-escaped single command fragment.
+shell_join() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        out+=" $(printf '%q' "$arg")"
+    done
+    echo "${out# }"
+}
+
+# shell_double_quote <value>
+# Returns value wrapped in double quotes with shell-safe escaping.
+shell_double_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//\$/\\$}"
+    s="${s//\`/\\\`}"
+    printf '"%s"' "$s"
+}
+
+# sanitize_command_for_log <cmd>
+# Redacts secrets from a command string before logging.
+sanitize_command_for_log() {
+    local cmd="$1"
+    if [[ -n "${MONGO_URI:-}" ]]; then
+        cmd="${cmd//${MONGO_URI}/$(redact_uri "${MONGO_URI}")}"
+    fi
+    echo "$cmd"
+}
+
+# backup_root_container_path
+# Converts BACKUP_ROOT into container path for volume bind.
+# - Absolute host paths stay same in container.
+# - Relative host paths (e.g. ./scratch/backups) map to absolute container paths (/scratch/backups).
+backup_root_container_path() {
+    local path="$1"
+
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+        return
+    fi
+
+    # Strip leading ./ segments and force absolute path in container.
+    while [[ "$path" == ./* ]]; do
+        path="${path#./}"
+    done
+
+    echo "/${path}"
+}
+
+# resolve_backup_volume_placeholder <command>
+# Replaces BACKUP_VOLUME token with --volume <host_backup_root>:<container_backup_root>.
+resolve_backup_volume_placeholder() {
+    local command="$1"
+
+    if [[ "$command" != *"BACKUP_VOLUME"* ]]; then
+        echo "$command"
+        return
+    fi
+
+    local container_backup_root
+    local mount_spec
+    local replacement
+
+    container_backup_root="$(backup_root_container_path "$BACKUP_ROOT")"
+    mount_spec="${BACKUP_ROOT}:${container_backup_root}"
+    replacement="--volume $(shell_join "$mount_spec")"
+
+    echo "${command//BACKUP_VOLUME/${replacement}}"
+}
+
+# build_mongodump_command <db> <collection> <target> [stderr_file]
+# Builds the exact shell command string used for mongodump execution.
+build_mongodump_command() {
+    local db="$1"
+    local collection="$2"
+    local target="$3"
+    local stderr_file="${4:-}"
+
+    local dump_cmd
+    local cmd
+
+    dump_cmd="$(resolve_backup_volume_placeholder "$MONGODUMP_CMD")"
+    cmd="${dump_cmd} --uri=$(shell_double_quote "$MONGO_URI") $(shell_join \
+        --db="$db" \
+        --collection="$collection" \
+        --archive="$target" \
+        --gzip \
+        --quiet)"
+
+    if [[ -n "$stderr_file" ]]; then
+        cmd+=" 2>$(shell_join "$stderr_file")"
+    fi
+
+    echo "$cmd"
 }
 
 # =============================================================================
@@ -137,7 +254,12 @@ Optional keys:
   exclude_databases=admin config local
   fallback_required_bytes=53687091200
   mongosh_cmd=mongosh
-  mongodump_cmd=mongodump
+    mongodump_cmd=mongodump
+        - If mongodump_cmd contains BACKUP_VOLUME, script replaces it with:
+            --volume <backup_root>:<container_backup_root>
+            Example:
+            backup_root=./scratch/backups -> --volume ./scratch/backups:/scratch/backups
+            backup_root=/var/backups/mongodb -> --volume /var/backups/mongodb:/var/backups/mongodb
 
 Example config file:
   mongo_uri=mongodb://mongoadmin:password@127.0.0.1:27017/
@@ -420,18 +542,28 @@ get_databases() {
     local exclude_pattern
     exclude_pattern="$(echo "$EXCLUDE_DATABASES" | tr ' ' '|')"
 
-    $MONGOSH_CMD --quiet "$MONGO_URI" \
-        --eval "db.adminCommand({listDatabases:1}).databases.filter(d => !/^(${exclude_pattern})$/.test(d.name)).forEach(d => print(d.name))" \
-        2>/dev/null | tr -d '\r' | sed '/^[[:space:]]*$/d' || true
+    local js
+    js="db.adminCommand({listDatabases:1}).databases.filter(d => !/^(${exclude_pattern})$/.test(d.name)).forEach(d => print(d.name))"
+
+    local cmd
+    cmd="${MONGOSH_CMD} --quiet $(shell_double_quote "$MONGO_URI") --eval $(shell_join "$js")"
+    log_stderr 2 "  CMD      $(sanitize_command_for_log "$cmd")"
+
+    eval "$cmd" 2>/dev/null | tr -d '\r' | sed '/^[[:space:]]*$/d' || true
 }
 
 get_collections() {
     local db="$1"
     # Keep auth context from the original URI; switch DB in mongosh instead.
     local db_escaped="${db//\'/\\\'}"
-    $MONGOSH_CMD --quiet "$MONGO_URI" \
-        --eval "db.getSiblingDB('${db_escaped}').getCollectionNames().forEach(c => print(c))" \
-        2>/dev/null | tr -d '\r' | sed '/^[[:space:]]*$/d'
+    local js
+    js="db.getSiblingDB('${db_escaped}').getCollectionNames().forEach(c => print(c))"
+
+    local cmd
+    cmd="${MONGOSH_CMD} --quiet $(shell_double_quote "$MONGO_URI") --eval $(shell_join "$js")"
+    log_stderr 2 "  CMD      $(sanitize_command_for_log "$cmd")"
+
+    eval "$cmd" 2>/dev/null | tr -d '\r' | sed '/^[[:space:]]*$/d'
 }
 
 # =============================================================================
@@ -444,17 +576,13 @@ backup_collection() {
     local target="${db_dir}/${collection}.archive.gz"
     local stderr_file="${target}.stderr.log.$$"
 
-    log 2 "  CMD      ${db}/${collection}: ${MONGODUMP_CMD} --uri=\"$(redact_uri "${MONGO_URI}")\" --db=${db} --collection=${collection} --archive=${target} --gzip --quiet"
+    local cmd
+    cmd="$(build_mongodump_command "$db" "$collection" "$target" "$stderr_file")"
+    log_stderr 2 "  CMD      ${db}/${collection}: $(sanitize_command_for_log "$cmd")"
 
-    if $MONGODUMP_CMD \
-        --uri=\""${MONGO_URI}"\" \
-        --db="$db" \
-        --collection="$collection" \
-        --archive="$target" \
-        --gzip \
-        --quiet \
-        2>"$stderr_file"; then
-        # Don't delete the log file if there were errors captured
+    if eval "$cmd"; then
+        # Success: clean up old stderr logs, then clean current log if empty
+        rm -f "${target}".stderr.log.* 2>/dev/null || true
         [[ ! -s "$stderr_file" ]] && rm -f "$stderr_file"
         return 0
     fi
@@ -480,15 +608,13 @@ backup_collection() {
 # =============================================================================
 
 # Wait until fewer than PARALLEL_JOBS background jobs are running.
-# Reaps finished jobs and records their exit codes.
+# Only checks process status; does not reap. Reaping is handled by reap_finished_jobs().
 wait_for_job_slot() {
     while (( ${#PIDS[@]} >= PARALLEL_JOBS )); do
         local new_pids=()
         for pid in "${PIDS[@]}"; do
             if kill -0 "$pid" 2>/dev/null; then
                 new_pids+=("$pid")
-            else
-                wait "$pid" && PID_STATUS[$pid]=0 || PID_STATUS[$pid]=$?
             fi
         done
         PIDS=("${new_pids[@]+"${new_pids[@]}"}")
@@ -506,13 +632,17 @@ drain_jobs() {
 }
 
 # Evaluate finished-job outcomes and update counters + log.
+# Idempotent: only waits on processes that haven't been reaped yet (checks PID_STATUS).
 reap_finished_jobs() {
     local new_pids=()
     for pid in "${PIDS[@]+"${PIDS[@]}"}"; do
         if kill -0 "$pid" 2>/dev/null; then
             new_pids+=("$pid")
         else
-            wait "$pid" && PID_STATUS[$pid]=0 || PID_STATUS[$pid]=$?
+            # Only wait if we haven't already reaped this pid
+            if [[ -z "${PID_STATUS[$pid]:-}" ]]; then
+                wait "$pid" && PID_STATUS[$pid]=0 || PID_STATUS[$pid]=$?
+            fi
             local label="${PID_LABEL[$pid]}"
             if [[ "${PID_STATUS[$pid]}" -eq 0 ]]; then
                 log 1 "  DONE     ${label}"
@@ -613,22 +743,30 @@ main() {
             local label="${db}/${collection}"
             local target="${db_dir}/${collection}.archive.gz"
 
+            # Reap finished jobs and log results (even if we're about to skip this collection)
+            # This ensures DONE messages are printed as jobs finish, not batched at the end
+            reap_finished_jobs
+
             # Resume: skip collections that already have a completed archive
-            if [[ "$RESUME" == true && -f "$target" ]]; then
+            if [[ "$RESUME" == true && -f "$target" && -s "$target" ]]; then
                 log 1 "  SKIP     ${label} (exists)"
                 (( SKIPPED++ )) || true
+                # Clean up any orphaned stderr logs from previous attempts
+                rm -f "${target}".stderr.log.*
                 continue
             fi
 
             if [[ "$DRY_RUN" == true ]]; then
+                local dry_cmd
+                dry_cmd="$(build_mongodump_command "$db" "$collection" "$target")"
                 log 1 "  [DRY-RUN] Would dump ${label}"
+                log_stderr 2 "  CMD      ${label}: $(sanitize_command_for_log "$dry_cmd")"
                 (( SKIPPED++ )) || true
                 continue
             fi
 
-            # Wait for a free job slot, reaping any finished jobs
+            # Wait for a free job slot
             wait_for_job_slot
-            reap_finished_jobs
 
             log 1 "  START    ${label}"
             backup_collection "$db" "$collection" "$db_dir" &

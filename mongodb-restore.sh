@@ -19,7 +19,7 @@
 set -euo pipefail
 
 __Author="Jerren Saunders"
-__Version="26.5.7"
+__Version="26.5.21"
 __ExePath="$0" # Executable path as called
 __ScriptName=$(basename "$0") # File name with extension
 __AppDir=$(dirname "$0") # Path where script is stored
@@ -82,11 +82,185 @@ log() {
     fi
 }
 
+# log_stderr <level> <message>
+# Same as log(), but always writes to stderr for pipeline-safe diagnostics.
+log_stderr() {
+    local level="$1"
+    local msg="$2"
+    if (( VERBOSE >= level )); then
+        local ts
+        ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        local line="[${ts}] ${msg}"
+
+        echo "$line" >&2
+
+        if [[ -n "${LOG_FILE:-}" ]]; then
+            echo "$line" >> "$LOG_FILE"
+        fi
+    fi
+}
+
 # redact_uri <uri>
 # Replaces the password component of a MongoDB URI with REDACTED.
 # e.g. mongodb://user:secret@host:27017/ → mongodb://user:REDACTED@host:27017/
 redact_uri() {
     echo "$1" | sed 's|\(://[^:@]*\):[^@]*@|\1:REDACTED@|'
+}
+
+# shell_join <arg1> [arg2 ...]
+# Returns shell-escaped single command fragment.
+shell_join() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        out+=" $(printf '%q' "$arg")"
+    done
+    echo "${out# }"
+}
+
+# shell_double_quote <value>
+# Returns value wrapped in double quotes with shell-safe escaping.
+shell_double_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//\$/\\$}"
+    s="${s//\`/\\\`}"
+    printf '"%s"' "$s"
+}
+
+# sanitize_command_for_log <cmd>
+# Redacts secrets from command string before logging.
+sanitize_command_for_log() {
+    local cmd="$1"
+    if [[ -n "${MONGO_URI:-}" ]]; then
+        cmd="${cmd//${MONGO_URI}/$(redact_uri "${MONGO_URI}")}"
+    fi
+    echo "$cmd"
+}
+
+# backup_root_container_path
+# Converts BACKUP_ROOT into container path for volume bind.
+# - Absolute host paths stay same in container.
+# - Relative host paths (e.g. ./scratch/backups) map to absolute container paths (/scratch/backups).
+backup_root_container_path() {
+    local path="$1"
+
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+        return
+    fi
+
+    while [[ "$path" == ./* ]]; do
+        path="${path#./}"
+    done
+
+    echo "/${path}"
+}
+
+# resolve_backup_volume_placeholder <command>
+# Replaces BACKUP_VOLUME token with --volume <host_backup_root>:<container_backup_root>.
+resolve_backup_volume_placeholder() {
+    local command="$1"
+
+    if [[ "$command" != *"BACKUP_VOLUME"* ]]; then
+        echo "$command"
+        return
+    fi
+
+    local container_backup_root
+    local mount_spec
+    local replacement
+
+    container_backup_root="$(backup_root_container_path "$BACKUP_ROOT")"
+    mount_spec="${BACKUP_ROOT}:${container_backup_root}"
+    replacement="--volume $(shell_join "$mount_spec")"
+
+    echo "${command//BACKUP_VOLUME/${replacement}}"
+}
+
+# map_archive_path_for_restore <archive>
+# Maps host archive path to container-visible path when BACKUP_VOLUME is used.
+map_archive_path_for_restore() {
+    local archive="$1"
+
+    if [[ "$MONGORESTORE_CMD" != *"BACKUP_VOLUME"* ]]; then
+        echo "$archive"
+        return
+    fi
+
+    local container_backup_root
+    local host_backup_root_clean
+    container_backup_root="$(backup_root_container_path "$BACKUP_ROOT")"
+    host_backup_root_clean="$BACKUP_ROOT"
+
+    while [[ "$host_backup_root_clean" == ./* ]]; do
+        host_backup_root_clean="${host_backup_root_clean#./}"
+    done
+
+    # Archive provided using same style as BACKUP_ROOT from config.
+    if [[ "$archive" == "$BACKUP_ROOT"/* ]]; then
+        echo "${container_backup_root}/${archive#${BACKUP_ROOT}/}"
+        return
+    fi
+
+    # Archive already points to container-style absolute path for relative backup roots.
+    if [[ "$archive" == "/${host_backup_root_clean}"/* ]]; then
+        echo "$archive"
+        return
+    fi
+
+    # Archive provided as absolute host path while backup_root is relative.
+    if [[ "$BACKUP_ROOT" != /* && "$archive" == /* ]]; then
+        local host_backup_root_abs=""
+        if command -v realpath >/dev/null 2>&1; then
+            host_backup_root_abs="$(realpath "$BACKUP_ROOT" 2>/dev/null || true)"
+        fi
+
+        if [[ -z "$host_backup_root_abs" ]] && command -v readlink >/dev/null 2>&1; then
+            host_backup_root_abs="$(readlink -f "$BACKUP_ROOT" 2>/dev/null || true)"
+        fi
+
+        if [[ -n "$host_backup_root_abs" && "$archive" == "$host_backup_root_abs"/* ]]; then
+            echo "${container_backup_root}/${archive#${host_backup_root_abs}/}"
+            return
+        fi
+    fi
+
+    echo "$archive"
+}
+
+# build_mongorestore_command <archive> [stderr_file]
+# Builds exact shell command string used for mongorestore execution.
+build_mongorestore_command() {
+    local archive="$1"
+    local stderr_file="${2:-}"
+    local archive_for_cmd
+
+    local restore_cmd
+    local cmd
+    local extra_args_str=""
+
+    restore_cmd="$(resolve_backup_volume_placeholder "$MONGORESTORE_CMD")"
+    archive_for_cmd="$(map_archive_path_for_restore "$archive")"
+    cmd="${restore_cmd} --uri=$(shell_double_quote "$MONGO_URI") $(shell_join \
+        --archive="$archive_for_cmd" \
+        --gzip)"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        cmd+=" $(shell_join --dryRun)"
+    fi
+
+    if (( ${#EXTRA_RESTORE_ARGS[@]} > 0 )); then
+        extra_args_str="$(shell_join "${EXTRA_RESTORE_ARGS[@]}")"
+        cmd+=" ${extra_args_str}"
+    fi
+
+    if [[ -n "$stderr_file" ]]; then
+        cmd+=" 2>$(shell_join "$stderr_file")"
+    fi
+
+    echo "$cmd"
 }
 
 print_usage() {
@@ -116,6 +290,11 @@ Configuration file (simple key=value format):
   mongo_uri=mongodb://user:pass@host/
   backup_root=/path/to/backups
   mongorestore_cmd=mongorestore
+        - If mongorestore_cmd contains BACKUP_VOLUME, script replaces it with:
+            --volume <backup_root>:<container_backup_root>
+            Example:
+            backup_root=./scratch/backups -> --volume ./scratch/backups:/scratch/backups
+            backup_root=/var/backups/mongodb -> --volume /var/backups/mongodb:/var/backups/mongodb
 
 EOF
 }
@@ -373,20 +552,11 @@ execute_restore() {
     local stderr_file
     stderr_file="${archive}.restore.stderr.$$"
 
-    local -a dry_run_args=()
-    if [[ "$DRY_RUN" == true ]]; then
-        dry_run_args+=("--dryRun")
-    fi
+    local cmd
+    cmd="$(build_mongorestore_command "$archive" "$stderr_file")"
+    log_stderr 2 "  CMD      ${archive}: $(sanitize_command_for_log "$cmd")"
 
-    log 2 "  CMD      ${MONGORESTORE_CMD} --uri=$(redact_uri "${MONGO_URI}") --archive=${archive} --gzip ${dry_run_args[*]} ${MONGO_RESTORE_FLAGS}"
-
-    if $MONGORESTORE_CMD \
-        --uri="${MONGO_URI}" \
-        --archive="${archive}" \
-        --gzip \
-        "${dry_run_args[@]}" \
-        "${EXTRA_RESTORE_ARGS[@]}" \
-        2>"$stderr_file"; then
+    if eval "$cmd"; then
         rm -f "$stderr_file"
         return 0
     fi
