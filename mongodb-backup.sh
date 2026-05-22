@@ -49,6 +49,7 @@ RESUME=false
 DRY_RUN=false
 VERBOSE=1
 HELP_REQUESTED=false
+ABORT_REQUESTED=false
 
 # Counters (modified only in main process)
 TOTAL=0
@@ -60,6 +61,25 @@ FAILED=0
 declare -a PIDS=()
 declare -A PID_LABEL=()   # pid → "db/collection"
 declare -A PID_STATUS=()  # pid → exit code (populated after wait)
+
+handle_interrupt() {
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        return
+    fi
+
+    ABORT_REQUESTED=true
+    log 0 ""
+    log 0 "[WARN ] Interrupt received (CTRL+C). Aborting cleanly..."
+
+    local pid
+    for pid in "${PIDS[@]+"${PIDS[@]}"}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -INT "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+trap 'handle_interrupt' INT
 
 # log <level> <message>
 # Prints message only when VERBOSE >= level.
@@ -611,6 +631,10 @@ backup_collection() {
 # Only checks process status; does not reap. Reaping is handled by reap_finished_jobs().
 wait_for_job_slot() {
     while (( ${#PIDS[@]} >= PARALLEL_JOBS )); do
+        if [[ "$ABORT_REQUESTED" == true ]]; then
+            break
+        fi
+
         local new_pids=()
         for pid in "${PIDS[@]}"; do
             if kill -0 "$pid" 2>/dev/null; then
@@ -723,6 +747,10 @@ main() {
     fi
 
     for db in "${databases[@]}"; do
+        if [[ "$ABORT_REQUESTED" == true ]]; then
+            break
+        fi
+
         local db_dir="${BACKUP_DIR}/${db}"
 
         log 1 "--- Database: ${db}"
@@ -739,6 +767,10 @@ main() {
         fi
 
         for collection in "${collections[@]}"; do
+            if [[ "$ABORT_REQUESTED" == true ]]; then
+                break
+            fi
+
             (( TOTAL++ )) || true
             local label="${db}/${collection}"
             local target="${db_dir}/${collection}.archive.gz"
@@ -767,6 +799,9 @@ main() {
 
             # Wait for a free job slot
             wait_for_job_slot
+            if [[ "$ABORT_REQUESTED" == true ]]; then
+                break
+            fi
 
             log 1 "  START    ${label}"
             backup_collection "$db" "$collection" "$db_dir" &
@@ -801,6 +836,9 @@ main() {
     log 0 " Failed            : ${FAILED}"
     log 0 " Backup location   : ${BACKUP_DIR}"
     log 0 " Log file          : ${LOG_FILE}"
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        log 0 " Aborted           : yes"
+    fi
     if [[ "$DRY_RUN" == false && -d "$BACKUP_DIR" ]]; then
         local used
         used="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
@@ -808,6 +846,10 @@ main() {
     fi
     log 0 "=========================================="
     log 1 "Backup complete. Succeeded: ${SUCCEEDED}, Failed: ${FAILED}, Skipped: ${SKIPPED}"
+
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        exit 130
+    fi
 
     if (( FAILED > 0 )); then
         exit 1

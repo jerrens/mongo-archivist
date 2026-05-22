@@ -44,6 +44,8 @@ DRY_RUN=false
 VERBOSE=1
 HELP_REQUESTED=false
 MONGO_RESTORE_FLAGS=""
+ABORT_REQUESTED=false
+CURRENT_CHILD_PID=""
 
 TOTAL=0
 SUCCEEDED=0
@@ -54,6 +56,22 @@ declare -a INPUT_PATHS=()
 declare -a RESOLVED_ARCHIVES=()
 declare -A SEEN_ARCHIVES=()
 declare -a EXTRA_RESTORE_ARGS=()
+
+handle_interrupt() {
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        return
+    fi
+
+    ABORT_REQUESTED=true
+    log 0 ""
+    log 0 "[WARN ] Interrupt received (CTRL+C). Aborting cleanly..."
+
+    if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
+        kill -INT "$CURRENT_CHILD_PID" 2>/dev/null || true
+    fi
+}
+
+trap 'handle_interrupt' INT
 
 # log <level> <message>
 # Prints message only when VERBOSE >= level.
@@ -556,12 +574,26 @@ execute_restore() {
     cmd="$(build_mongorestore_command "$archive" "$stderr_file")"
     log_stderr 2 "  CMD      ${archive}: $(sanitize_command_for_log "$cmd")"
 
-    if eval "$cmd"; then
+    eval "$cmd" &
+    CURRENT_CHILD_PID="$!"
+
+    local rc=0
+    if wait "$CURRENT_CHILD_PID"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    CURRENT_CHILD_PID=""
+
+    if [[ "$ABORT_REQUESTED" == true ]] || (( rc == 130 )); then
+        rm -f "$stderr_file"
+        return 130
+    fi
+
+    if (( rc == 0 )); then
         rm -f "$stderr_file"
         return 0
     fi
-
-    local rc=$?
 
     if (( VERBOSE >= 2 )); then
         if [[ -s "$stderr_file" ]]; then
@@ -607,6 +639,10 @@ main() {
 
     local input_errors=0
     for input_path in "${INPUT_PATHS[@]}"; do
+        if [[ "$ABORT_REQUESTED" == true ]]; then
+            break
+        fi
+
         log 1 "Scanning input: ${input_path}"
         if ! collect_archives_from_input "$input_path"; then
             (( input_errors++ )) || true
@@ -628,6 +664,10 @@ main() {
     log 1 "Archive files to process: ${#RESOLVED_ARCHIVES[@]}"
 
     for archive in "${RESOLVED_ARCHIVES[@]}"; do
+        if [[ "$ABORT_REQUESTED" == true ]]; then
+            break
+        fi
+
         (( TOTAL++ )) || true
         log 1 "  START    ${archive}"
 
@@ -638,6 +678,11 @@ main() {
                 (( DRY_RUN_COUNT++ )) || true
             fi
         else
+            local rc=$?
+            if (( rc == 130 )) || [[ "$ABORT_REQUESTED" == true ]]; then
+                break
+            fi
+
             log 0 "[ERROR]   FAILED   ${archive}"
             (( FAILED++ )) || true
         fi
@@ -653,7 +698,14 @@ main() {
     if [[ "$DRY_RUN" == true ]]; then
         log 0 " Dry-run operations  : ${DRY_RUN_COUNT}"
     fi
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        log 0 " Aborted             : yes"
+    fi
     log 0 "=================================================="
+
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        exit 130
+    fi
 
     if (( FAILED > 0 )); then
         exit 1
