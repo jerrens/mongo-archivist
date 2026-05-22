@@ -276,7 +276,7 @@ Path inputs (one or many):
 
 Options:
   --config <file>            Path to config file (optional)
-                               Defaults to <script-dir>/mongodb-backup.conf
+                               Defaults to <script-dir>/mongodb-archivist.conf
   --input <path>             Add an input path (can repeat)
   --mongo-restore-flags <s>  Raw flags passed to mongorestore
                                Example: --mongo-restore-flags="--drop --nsFrom=old.* --nsTo=new.*"
@@ -373,7 +373,7 @@ done
 
 # Resolve config file path if not provided.
 if [[ -z "$CONFIG_FILE" ]]; then
-    CONFIG_FILE="${__AppDir}/mongodb-backup.conf"
+    CONFIG_FILE="${__AppDir}/mongodb-archivist.conf"
 fi
 
 load_config_file() {

@@ -8,8 +8,8 @@ Bash scripts for backing up and restoring all MongoDB databases and collections 
 |------|-------------|
 | `mongodb-backup.sh` | Dumps all MongoDB databases/collections to `.archive.gz` files |
 | `mongodb-restore.sh` | Restores archives created by `mongodb-backup.sh` |
-| `mongodb-backup.conf` | Your local configuration file (not committed) |
-| `mongodb-backup.conf.example` | Template — copy to `mongodb-backup.conf` and fill in values |
+| `mongodb-archivist.conf` | Your local configuration file (not committed) |
+| `mongodb-archivist.conf.example` | Template — copy to `mongodb-archivist.conf` and fill in values |
 
 ---
 
@@ -18,7 +18,7 @@ Bash scripts for backing up and restoring all MongoDB databases and collections 
 Both scripts share the same config file. Copy the example and edit it:
 
 ```bash
-cp mongodb-backup.conf.example mongodb-backup.conf
+cp mongodb-backup.conf.example mongodb-archivist.conf
 ```
 
 ### Required keys
@@ -84,7 +84,7 @@ BACKUP_ROOT/
 ./mongodb-backup.sh [OPTIONS]
 
 Options:
-  --config <file>  Path to config file (default: mongodb-backup.conf)
+  --config <file>  Path to config file (default: mongodb-archivist.conf)
   --resume         Reuse the newest backup folder; skip collections that
                    already have a .archive.gz (safe re-run after interruption)
   --dry-run        Print what would be done without executing any mongodump
@@ -96,7 +96,7 @@ Options:
 ### Examples
 
 ```bash
-# Standard backup using mongodb-backup.conf
+# Standard backup using mongodb-archivist.conf
 ./mongodb-backup.sh
 
 # Explicit config file
@@ -129,7 +129,7 @@ Path inputs (one or many):
   - Individual *.archive.gz file
 
 Options:
-  --config <file>             Path to config file (default: mongodb-backup.conf)
+  --config <file>             Path to config file (default: mongodb-archivist.conf)
   --input <path>              Add an input path (repeatable)
   --mongo-restore-flags <s>   Raw flags forwarded to mongorestore
   --dry-run                   Run mongorestore with --dryRun (no data written)

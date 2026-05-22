@@ -230,7 +230,7 @@ Each collection is exported via mongodump and stored as a .archive.gz file under
 
 Options:
   --config <file> Path to config file (optional)
-                    Defaults to <script-dir>/${__AppName}.conf if not provided
+                    Defaults to <script-dir>/mongodb-archivist.conf if not provided
   --resume        Reuse the newest backup folder; skip collections that already
                     have a .archive.gz (allows safe re-run after interruption)
   --dry-run       Print what would be done without executing any mongodump
@@ -268,7 +268,7 @@ Example config file:
   exclude_databases=admin config local
 
 Example usage:
-    ./${__ScriptName}                              # Uses ./${__AppName}.conf if it exists
+    ./${__ScriptName}                              # Uses ./mongodb-archivist.conf if it exists
     ./${__ScriptName} --config backup.conf         # Explicit config file
     ./${__ScriptName} -v --help                    # Show help with config values
     ./${__ScriptName} --dry-run -vv                # Dry-run with verbose output
@@ -322,7 +322,7 @@ done
 
 # Resolve config file path if not provided.
 if [[ -z "$CONFIG_FILE" ]]; then
-    CONFIG_FILE="${__AppDir}/${__AppName}.conf"
+    CONFIG_FILE="${__AppDir}/mongodb-archivist.conf"
 fi
 
 # =============================================================================

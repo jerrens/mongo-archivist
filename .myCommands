@@ -1,0 +1,11 @@
+# MONGO_TARGET_URI and MONGO_SOURCE_URI are defined in the .mySecrets file
+include .mySecrets
+
+MONGO_IMAGE=docker.io/alpine/mongosh:latest
+# MONGO_IMAGE=docker.io/library/mongo:7.0-jammy
+
+mongosh=podman run --rm -it ${MONGO_IMAGE} mongosh "${MONGO_TARGET_URI}"
+
+[comp]
+cfg-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --target-uri "${MONGO_TARGET_URI}"
+dev-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --source-uri "${MONGO_SOURCE_URI}" --target-uri "${MONGO_TARGET_URI}"
