@@ -8,6 +8,7 @@ Bash scripts for backing up and restoring all MongoDB databases and collections 
 |------|-------------|
 | `mongodb-backup.sh` | Dumps all MongoDB databases/collections to `.archive.gz` files |
 | `mongodb-restore.sh` | Restores archives created by `mongodb-backup.sh` |
+| `mongodb-compare.sh` | Compares two MongoDB servers for collection-level synchronization |
 | `mongodb-archivist.conf` | Your local configuration file (not committed) |
 | `mongodb-archivist.conf.example` | Template — copy to `mongodb-archivist.conf` and fill in values |
 
@@ -163,6 +164,85 @@ Options:
   --input /var/backups/mongodb/2026-05-07_02-00-00/mydb \
   --input /var/backups/mongodb/2026-05-07_02-00-00/otherdb
 ```
+
+---
+
+## mongodb-compare.sh
+
+Compares two MongoDB servers/clusters for collection-level synchronization. Identifies missing collections, document count mismatches, and index count differences.
+
+### Output
+
+Generates three sections:
+
+1. **Source server table**: Database/collection counts, document counts, index counts, min/max `_id` values
+2. **Target server table**: Same metrics as source
+3. **Comparison table**: Status (`OK`, `DIFF`, `MISSING_SRC`, `MISSING_TGT`), with concise mismatch reasons
+
+### Usage
+
+```
+./mongodb-compare.sh --target-uri <uri> [OPTIONS]
+
+Options:
+  --config <file>     Path to config file (default: mongodb-archivist.conf)
+  --target-uri <uri>  Target MongoDB URI (required)
+  --source-uri <uri>  Source MongoDB URI (overrides mongo_uri from config)
+  --exclude-dbs <csv> Comma-separated DB names to exclude (appended to config list)
+  --only-dbs <csv>    Comma-separated DB names to scan only (ignores exclude list)
+  --version           Show script version and exit
+  -v / -vv / -vvv     Increase log verbosity
+  --help              Show help (add -v to also print current config values)
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All collections are in sync |
+| `2` | Differences found (missing collections or metric mismatches) |
+| `1` | Runtime error (config, connection, or query failure) |
+
+### Examples
+
+```bash
+# Compare source (from config) to target
+./mongodb-compare.sh --target-uri mongodb://target-server:27017/
+
+# Override source URI and compare specific databases only
+./mongodb-compare.sh \
+  --source-uri mongodb://prod-server:27017/ \
+  --target-uri mongodb://staging-server:27017/ \
+  --only-dbs=production,metrics,analytics
+
+# Compare with extra exclusions
+./mongodb-compare.sh \
+  --target-uri mongodb://target-server:27017/ \
+  --exclude-dbs=test,staging,temporary
+
+# Verbose output for debugging
+./mongodb-compare.sh \
+  --target-uri mongodb://target-server:27017/ \
+  -vv
+
+# Use in scripts (check exit code)
+if ./mongodb-compare.sh --target-uri mongodb://target:27017/; then
+  echo "Servers are in sync"
+else
+  echo "Differences found (exit code: $?)"
+fi
+```
+
+### Metrics explained
+
+- **DOC_COUNT**: Number of documents in the collection (from `estimatedDocumentCount()` or fallback to `countDocuments()`)
+- **INDEXES**: Number of indexes on the collection
+- **MIN_ID** / **MAX_ID**: Minimum and maximum `_id` values (in sort order), works for ObjectId and other types
+- **STATUS**:
+  - `OK`: Metrics match exactly between source and target
+  - `DIFF`: One or more metrics differ (doc count, index count, or _id bounds)
+  - `MISSING_SRC`: Collection exists on target but not on source
+  - `MISSING_TGT`: Collection exists on source but not on target
 
 ---
 
