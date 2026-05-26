@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
 # mongodb-compare.sh
-# Compare two MongoDB servers/clusters for collection-level synchronization.
-# Identifies schema differences, missing collections, and document/index counts.
+# Compare two MongoDB servers or two backup directories for collection differences.
 #
-# Usage:
-#   ./mongodb-compare.sh --target-uri <uri> [OPTIONS]
+# Server mode (default):
+#   Compare two live MongoDB instances for missing collections, doc/index counts.
+#   Usage: ./mongodb-compare.sh --target-uri <uri> [OPTIONS]
+#
+# Archive mode:
+#   Compare sha256 hashes of .archive.gz files across two backup snapshots.
+#   Usage: ./mongodb-compare.sh --mode compare-archives <path1> <path2> [OPTIONS]
 #
 # Options:
+#   --mode <mode>       Compare mode: servers (default) or compare-archives
 #   --config <file>     Path to config file (default: mongodb-archivist.conf)
-#   --target-uri <uri>  Target MongoDB URI (required)
+#   --target-uri <uri>  Target MongoDB URI (required for servers mode)
 #   --source-uri <uri>  Source MongoDB URI (overrides mongo_uri from config)
 #   --exclude-dbs <csv> Comma-separated list of DBs to exclude (appended to config)
 #   --only-dbs <csv>    Comma-separated list of DBs to scan only (ignores excludes)
@@ -34,6 +39,8 @@ __AppName=${__ScriptName%.*} # File name without extension
 MONGO_URI=""
 MONGOSH_CMD="mongosh"
 EXCLUDE_DATABASES="admin config local"
+BACKUP_ROOT=""
+PARALLEL_JOBS=4
 
 CONFIG_FILE=""
 
@@ -44,6 +51,9 @@ TARGET_URI=""
 SOURCE_URI_OVERRIDE=""
 EXTRA_EXCLUDE_DBS=""
 ONLY_DBS=""
+COMPARE_MODE="servers"
+ARCHIVE_PATH_1=""
+ARCHIVE_PATH_2=""
 
 # =============================================================================
 # INTERNAL — do not edit below unless you know what you are doing
@@ -245,12 +255,38 @@ Optional keys:
   mongosh_cmd=mongosh
   exclude_databases=admin config local
 
-Example usage:
+Example usage (servers mode):
     ./${__ScriptName} --target-uri mongodb://target:27017/
     ./${__ScriptName} --target-uri mongodb://target:27017/ --source-uri mongodb://prod:27017/
     ./${__ScriptName} --target-uri mongodb://target:27017/ --only-dbs=db1,db2,db3
     ./${__ScriptName} --target-uri mongodb://target:27017/ --exclude-dbs=test,staging
     ./${__ScriptName} --target-uri mongodb://target:27017/ -vv
+
+Archive Mode (--mode compare-archives):
+  Compare two local backup directories produced by mongodb-backup.sh.
+  Each directory should contain per-database subdirectories with *.archive.gz files.
+
+  Required:
+    <path1>   Path to first backup snapshot (timestamp directory)
+    <path2>   Path to second backup snapshot
+
+  Path resolution: if a bare folder name is given (not a full path), the script
+  looks for it under backup_root from the config file.
+
+  Output:
+    - Flat sorted table: db.collection | STATUS | NOTE
+    - Green  (SAME)     — sha256 hashes identical
+    - Red    (CHANGED) — both exist, hashes differ
+    - Purple (ORPHAN)    — archive only present in one backup
+
+  Exit codes:
+    0   All archives match
+    1   Differences or orphans found
+
+  Example usage:
+    ./${__ScriptName} --mode compare-archives /mnt/backups/mongodb/20260521_140606 /mnt/backups/mongodb/20260522_093012
+    ./${__ScriptName} --mode compare-archives 20260521_140606 20260522_093012
+    ./${__ScriptName} --mode compare-archives 20260521_140606 20260522_093012 -vv
 
 EOF
 }
@@ -273,6 +309,21 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             CONFIG_FILE="$1"
+            ;;
+        --mode)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --mode requires a value" >&2
+                exit 1
+            fi
+            shift
+            case "$1" in
+                compare-archives|archives) COMPARE_MODE="archives" ;;
+                servers) COMPARE_MODE="servers" ;;
+                *)
+                    echo "ERROR: Unknown mode: '$1'. Valid modes: servers, compare-archives" >&2
+                    exit 1
+                    ;;
+            esac
             ;;
         --target-uri)
             if [[ $# -lt 2 ]]; then
@@ -314,6 +365,17 @@ while [[ $# -gt 0 ]]; do
             echo "Unknown option: $arg" >&2
             print_usage >&2
             exit 1
+            ;;
+        *)
+            # Positional args: backup directory paths for compare-archives mode
+            if [[ -z "$ARCHIVE_PATH_1" ]]; then
+                ARCHIVE_PATH_1="$arg"
+            elif [[ -z "$ARCHIVE_PATH_2" ]]; then
+                ARCHIVE_PATH_2="$arg"
+            else
+                echo "ERROR: Unexpected argument: '${arg}'" >&2
+                exit 1
+            fi
             ;;
     esac
     shift
@@ -391,6 +453,16 @@ load_config_file() {
                 EXCLUDE_DATABASES="$value"
                 (( applied_keys++ )) || true
                 log 3 "[CFG ] exclude_databases='${EXCLUDE_DATABASES}'"
+                ;;
+            backup_root)
+                BACKUP_ROOT="$value"
+                (( applied_keys++ )) || true
+                log 3 "[CFG ] backup_root='${BACKUP_ROOT}'"
+                ;;
+            parallel_jobs)
+                PARALLEL_JOBS="$value"
+                (( applied_keys++ )) || true
+                log 3 "[CFG ] parallel_jobs='${PARALLEL_JOBS}'"
                 ;;
             *)
                 (( unknown_keys++ )) || true
@@ -993,6 +1065,234 @@ compare_and_report() {
 }
 
 # =============================================================================
+# ARCHIVE COMPARISON MODE
+# =============================================================================
+
+# resolve_archive_path <arg>
+# Resolves a path argument to an existing directory.
+# Resolution order:
+#   1. As-is (absolute or relative to cwd)
+#   2. $BACKUP_ROOT/<arg> (if backup_root is configured)
+# Prints the resolved absolute path on success. Returns 1 if not found.
+resolve_archive_path() {
+    local arg="$1"
+
+    if [[ -d "$arg" ]]; then
+        realpath "$arg"
+        return 0
+    fi
+
+    if [[ -n "${BACKUP_ROOT:-}" ]]; then
+        local candidate="${BACKUP_ROOT%/}/${arg}"
+        if [[ -d "$candidate" ]]; then
+            realpath "$candidate"
+            return 0
+        fi
+        log 2 "[PATH] Not found under backup_root: '${candidate}'"
+    fi
+
+    return 1
+}
+
+# scan_archive_dir <dir> <result_assoc_array_name>
+# Finds all *.archive.gz files under <dir> and computes their sha256 hash.
+# Populates result assoc array: [db.collection]=hash
+# Key derivation: strip <dir>/ prefix, strip .archive.gz suffix, replace / with .
+scan_archive_dir() {
+    local dir="$1"
+    local -n _scan_result_ref="$2"
+
+    log 2 "  Scanning: ${dir}"
+
+    local -a files=()
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(find "$dir" -name "*.archive.gz" -type f | sort)
+
+    if (( ${#files[@]} == 0 )); then
+        log 1 "  [WARN] No .archive.gz files found in: ${dir}"
+        return 0
+    fi
+
+    log 2 "  Found ${#files[@]} archive(s). Hashing with ${PARALLEL_JOBS} parallel job(s)..."
+
+    local hash_output
+    hash_output="$(printf '%s\n' "${files[@]}" | xargs -P "${PARALLEL_JOBS}" sha256sum)"
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local hash filepath relpath key
+        hash="${line%% *}"
+        filepath="${line##*  }"
+        relpath="${filepath#${dir}/}"
+        key="${relpath%.archive.gz}"
+        key="${key//\//.}"
+        _scan_result_ref["$key"]="$hash"
+        log 3 "    ${key} = ${hash:0:16}..."
+    done <<< "$hash_output"
+
+    log 1 "  Hashed ${#_scan_result_ref[@]} archive(s) in: $(basename "$dir")"
+    return 0
+}
+
+# compare_archives_and_report <path1> <label1> <path2> <label2>
+# Compares archives from two backup directories and prints a colored summary table.
+# Returns 0 if all archives match, 1 if any differences or orphans are found.
+compare_archives_and_report() {
+    local path1="$1"
+    local label1="$2"
+    local path2="$3"
+    local label2="$4"
+
+    declare -A _hashes1=()
+    declare -A _hashes2=()
+
+    log 1 ""
+    log 1 "=== Scanning Archives ==="
+    log 1 ""
+
+    scan_archive_dir "$path1" _hashes1
+    scan_archive_dir "$path2" _hashes2
+
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        return 130
+    fi
+
+    # Merge all keys from both sets
+    declare -A _all_keys_map=()
+    local _key
+    for _key in "${!_hashes1[@]}"; do _all_keys_map["$_key"]=1; done
+    for _key in "${!_hashes2[@]}"; do _all_keys_map["$_key"]=1; done
+
+    if (( ${#_all_keys_map[@]} == 0 )); then
+        log 0 "  (No archives found in either path)"
+        return 1
+    fi
+
+    # Sort keys
+    local -a _sorted_keys=()
+    IFS=$'\n' _sorted_keys=($(printf '%s\n' "${!_all_keys_map[@]}" | sort))
+    unset IFS
+
+    # Dynamic column width (minimum: length of "DB.COLLECTION" header = 13)
+    local _max_len=13
+    for _key in "${_sorted_keys[@]}"; do
+        (( ${#_key} > _max_len )) && _max_len=${#_key}
+    done
+    local _col=$(( _max_len + 2 ))
+
+    # ANSI color codes
+    local _GREEN='\033[1;32m'
+    local _RED='\033[0;31m'
+    local _PURPLE='\033[1;35m'
+    local _RESET='\033[0m'
+
+    # Counters
+    local _n_match=0 _n_diff=0 _n_orphan=0
+
+    # Header
+    echo ""
+    echo "=== Archive Comparison Results ==="
+    echo ""
+    printf "%-${_col}s  %-9s  %s\n" "DB.COLLECTION" "STATUS" "NOTE"
+    printf "%-${_col}s  %-9s  %s\n" \
+        "$(eval "printf '=%.0s' {1..$_col}")" \
+        "=========" \
+        "=============================="
+
+    for _key in "${_sorted_keys[@]}"; do
+        local _h1="${_hashes1[$_key]:-}"
+        local _h2="${_hashes2[$_key]:-}"
+        local _status _note _color
+
+        if [[ -n "$_h1" && -n "$_h2" ]]; then
+            if [[ "$_h1" == "$_h2" ]]; then
+                _status="SAME"; _note=""; _color="$_GREEN"
+                (( _n_match++ )) || true
+            else
+                _status="CHANGED"; _note=""; _color="$_RED"
+                (( _n_diff++ )) || true
+            fi
+        elif [[ -n "$_h1" ]]; then
+            _status="ORPHAN"; _note="(only in ${label1})"; _color="$_PURPLE"
+            (( _n_orphan++ )) || true
+        else
+            _status="ORPHAN"; _note="(only in ${label2})"; _color="$_PURPLE"
+            (( _n_orphan++ )) || true
+        fi
+
+        printf "${_color}%-${_col}s  %-9s  %s${_RESET}\n" "$_key" "$_status" "$_note"
+    done
+
+    # Summary
+    local _total=$(( _n_match + _n_diff + _n_orphan ))
+    log 0 ""
+    log 0 "=================================================="
+    log 0 " SUMMARY"
+    log 0 "--------------------------------------------------"
+    log 0 " Total archives        : ${_total}"
+    log 0 " Same                  : ${_n_match}"
+    log 0 " Changed               : ${_n_diff}"
+    log 0 " Orphans               : ${_n_orphan}"
+    log 0 "=================================================="
+    log 1 "Archive compare complete."
+
+    if (( _n_diff > 0 || _n_orphan > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+# run_archive_compare
+# Entry point for --mode compare-archives. Validates and resolves paths, then runs comparison.
+run_archive_compare() {
+    if [[ -z "$ARCHIVE_PATH_1" || -z "$ARCHIVE_PATH_2" ]]; then
+        echo "ERROR: compare-archives mode requires two backup directory paths" >&2
+        echo "Usage: ${__ScriptName} --mode compare-archives <path1> <path2>" >&2
+        exit 1
+    fi
+
+    # Load config (best-effort) to get backup_root and parallel_jobs
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_config_file "$CONFIG_FILE" 2>/dev/null || true
+    fi
+
+    # Resolve paths
+    local _resolved1 _resolved2
+    if ! _resolved1="$(resolve_archive_path "$ARCHIVE_PATH_1")"; then
+        echo "ERROR: Cannot find directory: '${ARCHIVE_PATH_1}'" >&2
+        [[ -n "${BACKUP_ROOT:-}" ]] && echo "       Also tried: '${BACKUP_ROOT%/}/${ARCHIVE_PATH_1}'" >&2
+        exit 1
+    fi
+    if ! _resolved2="$(resolve_archive_path "$ARCHIVE_PATH_2")"; then
+        echo "ERROR: Cannot find directory: '${ARCHIVE_PATH_2}'" >&2
+        [[ -n "${BACKUP_ROOT:-}" ]] && echo "       Also tried: '${BACKUP_ROOT%/}/${ARCHIVE_PATH_2}'" >&2
+        exit 1
+    fi
+
+    local _label1 _label2
+    _label1="$(basename "$_resolved1")"
+    _label2="$(basename "$_resolved2")"
+
+    log 0 "=================================================="
+    log 0 " MongoDB Archive Compare — ${SCRIPT_START_TIME}"
+    log 0 " Verbosity: ${VERBOSE}"
+    log 0 "--------------------------------------------------"
+    log 0 " [1] ${_resolved1}"
+    log 0 " [2] ${_resolved2}"
+    log 0 "=================================================="
+
+    local _rc=0
+    compare_archives_and_report "$_resolved1" "$_label1" "$_resolved2" "$_label2" || _rc=$?
+
+    if [[ "$ABORT_REQUESTED" == true ]]; then
+        exit 130
+    fi
+
+    exit $_rc
+}
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1006,6 +1306,12 @@ main() {
             print_config_values
         fi
         exit 0
+    fi
+
+    # Dispatch to archive comparison mode before any server-specific validation
+    if [[ "$COMPARE_MODE" == "archives" ]]; then
+        run_archive_compare
+        # run_archive_compare exits internally; this line is never reached
     fi
 
     # Load and validate configuration
