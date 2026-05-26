@@ -19,7 +19,7 @@
 set -euo pipefail
 
 __Author="Jerren Saunders"
-__Version="26.5.21"
+__Version="26.5.26"
 __ExePath="$0" # Executable path as called
 __ScriptName=$(basename "$0") # File name with extension
 __AppDir=$(dirname "$0") # Path where script is stored
