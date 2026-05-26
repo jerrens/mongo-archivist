@@ -274,7 +274,7 @@ Archive Mode (--mode compare-archives):
   looks for it under backup_root from the config file.
 
   Output:
-    - Flat sorted table: db.collection | STATUS | NOTE
+    - Flat sorted table: db.collection | HASH | NOTE
     - Green  (SAME)     — sha256 hashes identical
     - Red    (CHANGED) — both exist, hashes differ
     - Purple (ORPHAN)    — archive only present in one backup
@@ -1006,7 +1006,7 @@ compare_and_report() {
     fi
 
     # Print comparison header
-    printf "%-30s %-30s %10s %10s %10s\n" "DATABASE" "COLLECTION" "STATUS" "SRC_DOCS" "TGT_DOCS"
+    printf "%-30s %-30s %10s %10s %10s\n" "DATABASE" "COLLECTION" "HASH" "SRC_DOCS" "TGT_DOCS"
     printf "%-30s %-30s %10s %10s %10s\n" "$(printf '=%.0s' {1..30})" "$(printf '=%.0s' {1..30})" "$(printf '=%.0s' {1..10})" "$(printf '=%.0s' {1..10})" "$(printf '=%.0s' {1..10})"
 
     # Compare each collection
@@ -1094,13 +1094,14 @@ resolve_archive_path() {
     return 1
 }
 
-# scan_archive_dir <dir> <result_assoc_array_name>
-# Finds all *.archive.gz files under <dir> and computes their sha256 hash.
-# Populates result assoc array: [db.collection]=hash
+# scan_archive_dir <dir> <hash_assoc_array_name> <size_assoc_array_name>
+# Finds all *.archive.gz files under <dir>, computes sha256 hash and human-readable
+# size for each. Populates both assoc arrays keyed by db.collection.
 # Key derivation: strip <dir>/ prefix, strip .archive.gz suffix, replace / with .
 scan_archive_dir() {
     local dir="$1"
     local -n _scan_result_ref="$2"
+    local -n _scan_sizes_ref="$3"
 
     log 2 "  Scanning: ${dir}"
 
@@ -1131,6 +1132,30 @@ scan_archive_dir() {
         log 3 "    ${key} = ${hash:0:16}..."
     done <<< "$hash_output"
 
+    # Collect file sizes via stat + awk (one pass, no per-file subshells)
+    local size_output
+    size_output="$(
+        stat -c '%s %n' "${files[@]}" | awk '{
+            bytes = $1
+            sub(/^[0-9]+ /, "")   # remove leading byte count, keep full path
+            filepath = $0
+            if      (bytes >= 1073741824) fmt = sprintf("%.1f G", bytes / 1073741824)
+            else if (bytes >= 1048576)    fmt = sprintf("%.1f M", bytes / 1048576)
+            else if (bytes >= 1024)       fmt = sprintf("%.1f K", bytes / 1024)
+            else                          fmt = bytes " B"
+            print fmt "\t" filepath
+        }'
+    )"
+
+    while IFS=$'\t' read -r hsize filepath; do
+        [[ -z "$filepath" ]] && continue
+        local relpath key
+        relpath="${filepath#${dir}/}"
+        key="${relpath%.archive.gz}"
+        key="${key//\//.}"
+        _scan_sizes_ref["$key"]="$hsize"
+    done <<< "$size_output"
+
     log 1 "  Hashed ${#_scan_result_ref[@]} archive(s) in: $(basename "$dir")"
     return 0
 }
@@ -1146,13 +1171,15 @@ compare_archives_and_report() {
 
     declare -A _hashes1=()
     declare -A _hashes2=()
+    declare -A _sizes1=()
+    declare -A _sizes2=()
 
     log 1 ""
     log 1 "=== Scanning Archives ==="
     log 1 ""
 
-    scan_archive_dir "$path1" _hashes1
-    scan_archive_dir "$path2" _hashes2
+    scan_archive_dir "$path1" _hashes1 _sizes1
+    scan_archive_dir "$path2" _hashes2 _sizes2
 
     if [[ "$ABORT_REQUESTED" == true ]]; then
         return 130
@@ -1181,6 +1208,14 @@ compare_archives_and_report() {
     done
     local _col=$(( _max_len + 2 ))
 
+    # Size column width: wide enough for both labels, min 6, max 15
+    local _scol=6
+    (( ${#label1} > _scol )) && _scol=${#label1}
+    (( ${#label2} > _scol )) && _scol=${#label2}
+    (( _scol > 15 )) && _scol=15
+    local _lh1="${label1:0:${_scol}}"
+    local _lh2="${label2:0:${_scol}}"
+
     # ANSI color codes
     local _GREEN='\033[1;32m'
     local _RED='\033[0;31m'
@@ -1194,15 +1229,20 @@ compare_archives_and_report() {
     echo ""
     echo "=== Archive Comparison Results ==="
     echo ""
-    printf "%-${_col}s  %-9s  %s\n" "DB.COLLECTION" "STATUS" "NOTE"
-    printf "%-${_col}s  %-9s  %s\n" \
+    printf "%-${_col}s  %${_scol}s  %${_scol}s    %-9s  %s\n" \
+        "DB.COLLECTION" "$_lh1" "$_lh2" "HASH" "NOTE"
+    printf "%-${_col}s  %${_scol}s  %${_scol}s    %-9s  %s\n" \
         "$(eval "printf '=%.0s' {1..$_col}")" \
+        "$(eval "printf '=%.0s' {1..$_scol}")" \
+        "$(eval "printf '=%.0s' {1..$_scol}")" \
         "=========" \
         "=============================="
 
     for _key in "${_sorted_keys[@]}"; do
         local _h1="${_hashes1[$_key]:-}"
         local _h2="${_hashes2[$_key]:-}"
+        local _sz1="${_sizes1[$_key]:--}"
+        local _sz2="${_sizes2[$_key]:--}"
         local _status _note _color
 
         if [[ -n "$_h1" && -n "$_h2" ]]; then
@@ -1214,14 +1254,15 @@ compare_archives_and_report() {
                 (( _n_diff++ )) || true
             fi
         elif [[ -n "$_h1" ]]; then
-            _status="ORPHAN"; _note="(only in ${label1})"; _color="$_PURPLE"
+            _status="ORPHAN"; _note="(only in ${label1})"; _color="$_PURPLE"; _sz2="-"
             (( _n_orphan++ )) || true
         else
-            _status="ORPHAN"; _note="(only in ${label2})"; _color="$_PURPLE"
+            _status="ORPHAN"; _note="(only in ${label2})"; _color="$_PURPLE"; _sz1="-"
             (( _n_orphan++ )) || true
         fi
 
-        printf "${_color}%-${_col}s  %-9s  %s${_RESET}\n" "$_key" "$_status" "$_note"
+        printf "${_color}%-${_col}s  %${_scol}s  %${_scol}s    %-9s  %s${_RESET}\n" \
+            "$_key" "$_sz1" "$_sz2" "$_status" "$_note"
     done
 
     # Summary

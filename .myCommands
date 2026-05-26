@@ -7,5 +7,6 @@ MONGO_IMAGE=docker.io/alpine/mongosh:latest
 mongosh=podman run --rm -it ${MONGO_IMAGE} mongosh "${MONGO_TARGET_URI}"
 
 [comp]
-cfg-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --target-uri "${MONGO_TARGET_URI}"
-dev-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --source-uri "${MONGO_SOURCE_URI}" --target-uri "${MONGO_TARGET_URI}"
+
+# description: <bkp1> <bkp2> - Compares the two backups
+backup=${REPO_ROOT}/mongodb-compare.sh --mode archives 
