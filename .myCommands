@@ -1,12 +1,30 @@
-# MONGO_TARGET_URI and MONGO_SOURCE_URI are defined in the .mySecrets file
+# MONGO_DEV_URI and MONGO_TEMP_URI are defined in the .mySecrets file
 include .mySecrets
 
 MONGO_IMAGE=docker.io/alpine/mongosh:latest
 # MONGO_IMAGE=docker.io/library/mongo:7.0-jammy
 
-mongosh=podman run --rm -it ${MONGO_IMAGE} mongosh "${MONGO_TARGET_URI}"
+mongosh=podman run --rm -it ${MONGO_IMAGE} mongosh "${MONGO_TEMP_URI}"
+
+
+[backup]
+dev=cd ${REPO_ROOT} && ./mongodb-backup.sh --source-uri "${MONGO_DEV_URI}"
+temp=cd ${REPO_ROOT} && ./mongodb-backup.sh --source-uri "${MONGO_TEMP_URI}"
+
+[restore]
+# description: <bkp> - Restores the specified backup archive(s) to the DEV server
+dev=cd ${REPO_ROOT} && ./mongodb-restore.sh --target-uri "${MONGO_DEV_URI}"
+
+# description: <bkp> - Restores the specified backup archive(s) to the TEMP server
+temp=cd ${REPO_ROOT} && ./mongodb-restore.sh --target-uri "${MONGO_TEMP_URI}"
+
 
 [comp]
+# description: Compares the server specified in the config file to the TEMP server
+cfg-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --target-uri "${MONGO_TEMP_URI}"
+
+# description: Compares the DEV server collections to the TEMP server collections
+dev-temp=cd ${REPO_ROOT} && ./mongodb-compare.sh --source-uri "${MONGO_DEV_URI}" --target-uri "${MONGO_TEMP_URI}"
 
 # description: <bkp1> <bkp2> - Compares the two backups
 backup=${REPO_ROOT}/mongodb-compare.sh --mode archives 

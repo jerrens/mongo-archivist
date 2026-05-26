@@ -28,6 +28,7 @@ __AppName=${__ScriptName%.*} # File name without extension
 # Default values (used if not specified in config file)
 MONGO_URI=""
 BACKUP_ROOT=""
+SOURCE_URI=""  # Override MONGO_URI via command line
 PARALLEL_JOBS=4
 EXCLUDE_DATABASES="admin config local"
 FALLBACK_REQUIRED_BYTES=$(( 50 * 1024 * 1024 * 1024 ))
@@ -251,6 +252,7 @@ Each collection is exported via mongodump and stored as a .archive.gz file under
 Options:
   --config <file> Path to config file (optional)
                     Defaults to <script-dir>/mongodb-archivist.conf if not provided
+  --source-uri <uri> MongoDB source URI (overrides mongo_uri from config file)
   --resume        Reuse the newest backup folder; skip collections that already
                     have a .archive.gz (allows safe re-run after interruption)
   --dry-run       Print what would be done without executing any mongodump
@@ -318,6 +320,14 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             CONFIG_FILE="$1"
+            ;;
+        --source-uri)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --source-uri requires a URI" >&2
+                exit 1
+            fi
+            shift
+            SOURCE_URI="$1"
             ;;
         --resume)
             RESUME=true
@@ -703,6 +713,13 @@ main() {
     load_config_file "$CONFIG_FILE"
     log 2 "[CFG ] Config load completed"
     log 3 "[CFG ] Post-load checks: MONGO_URI_set=$([[ -n "$MONGO_URI" ]] && echo yes || echo no), BACKUP_ROOT='${BACKUP_ROOT}'"
+
+    # Override MONGO_URI with command-line --source-uri if provided
+    if [[ -n "$SOURCE_URI" ]]; then
+        log 2 "[CFG ] Overriding mongo_uri with --source-uri"
+        MONGO_URI="$SOURCE_URI"
+    fi
+
     validate_config
     log 2 "[CFG ] Configuration validation passed"
 

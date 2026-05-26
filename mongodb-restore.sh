@@ -30,6 +30,7 @@ __AppName=${__ScriptName%.*} # File name without extension
 # =============================================================================
 MONGO_URI=""
 BACKUP_ROOT=""
+TARGET_URI=""  # Override MONGO_URI via command line
 MONGORESTORE_CMD="mongorestore"
 
 CONFIG_FILE=""
@@ -295,6 +296,7 @@ Path inputs (one or many):
 Options:
   --config <file>            Path to config file (optional)
                                Defaults to <script-dir>/mongodb-archivist.conf
+  --target-uri <uri>         MongoDB target URI (overrides mongo_uri from config file)
   --input <path>             Add an input path (can repeat)
   --mongo-restore-flags <s>  Raw flags passed to mongorestore
                                Example: --mongo-restore-flags="--drop --nsFrom=old.* --nsTo=new.*"
@@ -337,6 +339,14 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             CONFIG_FILE="$1"
+            ;;
+        --target-uri)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --target-uri requires a URI" >&2
+                exit 1
+            fi
+            shift
+            TARGET_URI="$1"
             ;;
         --input)
             if [[ $# -lt 2 ]]; then
@@ -627,6 +637,13 @@ fi
 main() {
     load_config_file "$CONFIG_FILE"
     validate_config
+
+    # Override MONGO_URI with command-line --target-uri if provided
+    if [[ -n "$TARGET_URI" ]]; then
+        log 2 "[CFG ] Overriding mongo_uri with --target-uri"
+        MONGO_URI="$TARGET_URI"
+    fi
+
     check_prerequisites
     parse_mongo_restore_flags
 
