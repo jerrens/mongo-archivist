@@ -1,0 +1,8 @@
+# Export ignore rules for GitHub archives
+# Only include the 3 shell scripts and the example config file
+
+.cspell.json export-ignore
+.gitattributes export-ignore
+.myCommands export-ignore
+LICENSE export-ignore
+README.md export-ignore
