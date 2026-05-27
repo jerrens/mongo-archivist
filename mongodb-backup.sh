@@ -16,7 +16,7 @@
 set -euo pipefail
 
 __Author="Jerren Saunders"
-__Version="26.5.26"
+__Version="26.5.27"
 __ExePath="$0" # Executable path as called
 __ScriptName=$(basename "$0") # File name with extension
 __AppDir=$(dirname "$0") # Path where script is stored
@@ -469,6 +469,16 @@ validate_config() {
         echo -e "ERROR: Configuration validation failed:\n${errors}" >&2
         exit 1
     fi
+
+    # Convert BACKUP_ROOT to an absolute path if it's relative.
+    # This ensures find commands and subshells (--resume, background jobs) use consistent paths.
+    if [[ "$BACKUP_ROOT" != /* ]]; then
+        if ! BACKUP_ROOT="$(cd "$BACKUP_ROOT" 2>/dev/null && pwd)"; then
+            echo "ERROR: Cannot resolve BACKUP_ROOT path: '${BACKUP_ROOT}'" >&2
+            exit 1
+        fi
+        log 2 "[CFG ] Converted relative BACKUP_ROOT to absolute: ${BACKUP_ROOT}"
+    fi
 }
 
 print_config_values() {
@@ -739,7 +749,22 @@ main() {
         mkdir -p "$BACKUP_DIR"
     fi
 
-    LOG_FILE="${BACKUP_DIR}/${__AppName}.log"
+    if [[ "$RESUME" == true ]]; then
+        # Resume should continue the existing run log in BACKUP_DIR when possible.
+        if [[ -f "${BACKUP_DIR}/${__AppName}.log" ]]; then
+            LOG_FILE="${BACKUP_DIR}/${__AppName}.log"
+        else
+            local existing_log
+            existing_log="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.log' | sort -r | head -1)"
+            if [[ -n "$existing_log" ]]; then
+                LOG_FILE="$existing_log"
+            else
+                LOG_FILE="${BACKUP_DIR}/${__AppName}.log"
+            fi
+        fi
+    else
+        LOG_FILE="${BACKUP_DIR}/${__AppName}.log"
+    fi
 
     log 0 "=================================================="
     log 0 " MongoDB Backup — ${SCRIPT_START_TIME}"
